@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# Drive the pstack plugin the way a Claude Code user does, in a throwaway HOME.
+# Usage: control-pstack <launch|doctor|commands|run|approve|plugin|files|checks|cleanup> [args]. See ../SKILL.md.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${VERIFY_PSTACK_ROOT:-/tmp/verify-pstack}"
+TREE="$REPO/harness/pstack/claude-code"
+PLUGIN="pstack@cursor-plugins"
+
+die() { echo "control-pstack: $*" >&2; exit 1; }
+
+run_dir() {
+  [[ -n "${VERIFY_PSTACK_RUN:-}" ]] || die "VERIFY_PSTACK_RUN is unset. Run 'control-pstack launch' and eval its export line."
+  [[ "$VERIFY_PSTACK_RUN" =~ ^[A-Za-z0-9._-]+$ ]] || die "VERIFY_PSTACK_RUN must be a plain name."
+  local dir="$ROOT/$VERIFY_PSTACK_RUN"
+  [[ -f "$dir/.owned-by-control-pstack" ]] || die "$dir was not created by control-pstack launch."
+  echo "$dir"
+}
+
+# Run a command as the isolated user. Variables that tie a process to a parent Claude Code session are dropped, so
+# the child never writes into the parent's transcript or socket. Auth variables (ANTHROPIC_*) pass through.
+as_user() {
+  local dir="$1"; shift
+  env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_REMOTE_SESSION_ID -u CLAUDE_CODE_MESSAGING_SOCKET \
+      -u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_TEE_SDK_STDOUT -u CLAUDE_CODE_DIAGNOSTICS_FILE \
+      -u CLAUDE_CODE_CHILD_SESSION -u CLAUDECODE -u CLAUDE_PID -u CLAUDE_ADDITIONAL_DIRECTORIES \
+      -u CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD -u CLAUDE_CODE_SYNC_PLUGINS -u CLAUDE_CODE_SYNC_SKILLS \
+      HOME="$dir/home" CLAUDE_CONFIG_DIR="$dir/home/.claude" "$@"
+}
+
+cmd_launch() {
+  command -v claude >/dev/null || die "claude is not on PATH."
+  local id="${VERIFY_PSTACK_RUN:-run-$(date +%Y%m%d-%H%M%S)-$$}"
+  [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]] || die "VERIFY_PSTACK_RUN must be a plain name."
+  local dir="$ROOT/$id"
+  [[ ! -e "$dir" ]] || die "$dir already exists. Pick another VERIFY_PSTACK_RUN or clean it up."
+  mkdir -p "$dir/home/.claude" "$dir/work" "$dir/artifacts"
+  touch "$dir/.owned-by-control-pstack"
+  git -C "$dir/work" init -q
+  node "$REPO/scripts/generate-pstack-harness-trees.mjs" --check >"$dir/artifacts/harness-check.txt" 2>&1 \
+    || die "harness/pstack is stale; run 'node scripts/generate-pstack-harness-trees.mjs' first. See $dir/artifacts/harness-check.txt."
+  {
+    echo "\$ claude plugin marketplace add $REPO"; as_user "$dir" claude plugin marketplace add "$REPO"
+    echo "\$ claude plugin install $PLUGIN"; as_user "$dir" claude plugin install "$PLUGIN"
+    echo "\$ claude plugin list"; as_user "$dir" claude plugin list
+  } >"$dir/artifacts/install.txt" 2>&1 || die "install failed; see $dir/artifacts/install.txt"
+  echo "ready: $PLUGIN installed from $REPO into $dir/home"
+  echo "export VERIFY_PSTACK_RUN=$id"
+}
+
+cmd_doctor() {
+  local dir; dir="$(run_dir)"
+  local ok=1 list want got
+  echo "repo:      $REPO"
+  echo "run dir:   $dir"
+  echo "claude:    $(claude --version 2>&1)"
+  list="$(as_user "$dir" claude plugin list 2>&1)"
+  grep -q "> $PLUGIN" <<<"$list" || { echo "FAIL: $PLUGIN not installed"; ok=0; }
+  grep -q "Read from: $TREE" <<<"$list" || { echo "FAIL: plugin is not read from $TREE"; ok=0; }
+  grep -q "Status: .*enabled" <<<"$list" || { echo "FAIL: plugin not enabled"; ok=0; }
+  want="$(node -p "require('$TREE/plugin.json').version")"
+  got="$(sed -n 's/.*Version: //p' <<<"$list" | head -1)"
+  [[ "$want" == "$got" ]] || { echo "FAIL: installed version '$got', tree version '$want'"; ok=0; }
+  echo "version:   $got"
+  node "$REPO/scripts/generate-pstack-harness-trees.mjs" --check >/dev/null 2>&1 \
+    || { echo "FAIL: harness/pstack is stale; installed skills lag pstack/"; ok=0; }
+  # Install copies the tree into a cache, so edits made after launch are invisible until a fresh launch.
+  local cache
+  cache="$(node -p "require('$dir/home/.claude/plugins/installed_plugins.json').plugins['$PLUGIN']?.[0]?.installPath ?? ''" 2>/dev/null || true)"
+  if [[ -z "$cache" ]]; then echo "FAIL: no install path recorded for $PLUGIN"; ok=0
+  elif ! diff -rq "$cache" "$TREE" >/dev/null 2>&1; then echo "FAIL: installed copy $cache differs from $TREE; launch a new run"; ok=0
+  else echo "installed: $cache (matches tree)"; fi
+  if [[ $ok == 1 ]]; then echo "doctor: OK"; else echo "doctor: NOT OK"; exit 1; fi
+}
+
+# run <name> <prompt> [claude args...]: one headless session; transcript and summary go to artifacts/<name>.*
+# The isolated HOME is always an --add-dir, so the session can read the installed plugin and ~/.claude like a user
+# who approved those reads. Anything else outside work/ still needs an explicit --add-dir.
+cmd_run() {
+  local dir; dir="$(run_dir)"
+  [[ $# -ge 2 ]] || die "usage: control-pstack run <name> <prompt> [claude args...]"
+  local name="$1" prompt="$2"; shift 2
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "name must be a plain word."
+  local out="$dir/artifacts/$name" code=0
+  printf '%s\n' "$prompt" >"$out.prompt.txt"
+  (cd "$dir/work" && as_user "$dir" claude -p "$prompt" --output-format stream-json --verbose --add-dir "$dir/home" "$@" \
+     >"$out.jsonl" 2>"$out.stderr.txt") || code=$?
+  echo "$code" >"$out.exit.txt"
+  node "$HERE/summarize.mjs" "$out.jsonl" | tee "$out.summary.txt"
+  echo "exit: $code"
+  echo "artifacts: $out.{prompt.txt,jsonl,stderr.txt,exit.txt,summary.txt}"
+  [[ $code == 0 ]]
+}
+
+# approve <name>: act as the user clicking "Approve" on the Write prompts that run <name> was denied.
+cmd_approve() {
+  local dir; dir="$(run_dir)"
+  [[ $# -eq 1 ]] || die "usage: control-pstack approve <name>"
+  node "$HERE/apply-denied-writes.mjs" "$dir/artifacts/$1.jsonl" "$dir/home" | tee "$dir/artifacts/$1.approved.txt"
+}
+
+# plugin <args...>: run `claude plugin <args>` as the isolated user (enable, disable, list, details, ...).
+cmd_plugin() {
+  local dir; dir="$(run_dir)"
+  as_user "$dir" claude plugin "$@"
+}
+
+cmd_commands() { cmd_run commands "Reply with just OK" --max-turns 1; }
+
+# files: list every file under the isolated HOME and workspace, so a run can prove what it wrote.
+cmd_files() {
+  local dir; dir="$(run_dir)"
+  (cd "$dir" && find home work -path home/.claude/plugins -prune -o -path work/.git -prune -o -type f -print | sort)
+}
+
+cmd_checks() {
+  local dir; dir="$(run_dir)"
+  local out="$dir/artifacts/checks.txt" fail=0
+  : >"$out"
+  step() {
+    echo "\$ $*" | tee -a "$out"
+    if (cd "$REPO" && "$@") >>"$out" 2>&1; then echo "  pass" | tee -a "$out"; else echo "  FAIL" | tee -a "$out"; fail=1; fi
+  }
+  if [[ ! -d "$REPO/node_modules/ajv-formats" || ! -d "$REPO/node_modules/fast-check" ]]; then
+    step npm install --no-save ajv ajv-formats fast-check@4.5.3
+  fi
+  step node scripts/validate-plugins.mjs
+  step node scripts/generate-pstack-harness-trees.mjs --check
+  step node scripts/check-pstack-docs.mjs
+  local tests; tests="$(cd "$REPO" && ls pstack/skills/*/scripts/test/*.test.ts)"
+  # shellcheck disable=SC2086
+  step node --disable-warning=ExperimentalWarning --test $tests
+  echo "log: $out"
+  [[ $fail == 0 ]]
+}
+
+cmd_cleanup() {
+  local dir; dir="$(run_dir)"
+  case "$dir" in "$ROOT"/?*) ;; *) die "refusing to clean $dir" ;; esac
+  rm -rf -- "$dir/home" "$dir/work"
+  echo "removed $dir/home and $dir/work; evidence kept in $dir/artifacts"
+}
+
+case "${1:-}" in
+  launch|doctor|commands|run|approve|plugin|files|checks|cleanup) c="$1"; shift; "cmd_$c" "$@" ;;
+  *) die "usage: control-pstack <launch|doctor|commands|run|approve|plugin|files|checks|cleanup> [args]" ;;
+esac
